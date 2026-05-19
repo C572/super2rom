@@ -1,113 +1,428 @@
-name: Firmware ROM Extractor (Optimized 7z)
+name: Firmware ROM Extractor - Robust
 
 on:
   workflow_dispatch:
     inputs:
       ARCHIVE_URL:
-        description: "Firmware zip URL (raw link)"
+        description: "Firmware archive URL"
         required: true
       OUTPUT_NAME:
+        description: "Output archive prefix"
         default: "rom"
         required: true
       SLOT:
-        description: "Select slot to extract (A/B)"
+        description: "Slot to extract from super"
         type: choice
-        options: ["_a","_b"]
+        options:
+          - "_a"
+          - "_b"
+          - "none"
         default: "_a"
         required: true
       INCLUDE_NON_SUPER:
         description: "Include non-super images"
         type: choice
-        options: ["true","false"]
+        options:
+          - "true"
+          - "false"
         default: "false"
         required: true
+      COMPRESSION_LEVEL:
+        description: "7z compression level"
+        type: choice
+        options:
+          - "5"
+          - "7"
+          - "9"
+        default: "7"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rom-extractor-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  process:
+  extract:
     runs-on: ubuntu-latest
-    permissions: write-all
+    timeout-minutes: 360
+
+    env:
+      ARCHIVE_URL: ${{ inputs.ARCHIVE_URL }}
+      OUTPUT_NAME: ${{ inputs.OUTPUT_NAME }}
+      SLOT: ${{ inputs.SLOT }}
+      INCLUDE_NON_SUPER: ${{ inputs.INCLUDE_NON_SUPER }}
+      COMPRESSION_LEVEL: ${{ inputs.COMPRESSION_LEVEL }}
+
+      WORK: work
+      IN: work/in
+      EXTRACTED: work/extracted
+      SUPER_OUT: work/super_out
+      FINAL: work/final
+      NONSUPER: work/nonsuper
+      GROUPS: work/groups
+      OUT: out
 
     steps:
-      # Install + Download
-      - run: |
-          set -e
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Disk before cleanup:"
+          df -h
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/lib/android/sdk || true
+          docker system prune -af || true
+
+          echo "Disk after cleanup:"
+          df -h
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
           sudo apt-get update -y
-          sudo apt-get install -y p7zip-full unzip git python3 python3-pip
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            file \
+            git \
+            p7zip-full \
+            unzip \
+            xz-utils \
+            zstd \
+            brotli \
+            gzip \
+            python3 \
+            python3-pip \
+            python3-venv \
+            android-sdk-libsparse-utils
 
-          mkdir -p in extracted super_out final nonsuper out groups
+          python3 -m venv "$WORK/venv"
+          "$WORK/venv/bin/python" -m pip install --upgrade pip protobuf
 
-          curl -L --fail "${{ github.event.inputs.ARCHIVE_URL }}" -o in/fw.zip
-          7z x in/fw.zip -oextracted
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$IN" "$EXTRACTED" "$SUPER_OUT" "$FINAL" "$NONSUPER" "$GROUPS" "$OUT"
 
-      # Extract super
-      - run: |
-          set -e
-          SUPER=$(find extracted -type f -name "super*.img*" | head -n1)
-          [ -n "$SUPER" ] || exit 1
+      - name: Download firmware
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-          git clone https://github.com/unix3dgforce/lpunpack.git
-          pip3 install protobuf
+          FW="$IN/firmware.bin"
 
-          python3 lpunpack/lpunpack.py "$SUPER" super_out
+          curl -L \
+            --fail \
+            --retry 10 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            --connect-timeout 45 \
+            -C - \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36" \
+            -o "$FW" \
+            "$ARCHIVE_URL"
 
-      # Filter ROM partitions
-      - run: |
-          set -e
-          SLOT="${{ github.event.inputs.SLOT }}"
+          echo "Downloaded file:"
+          ls -lh "$FW"
+          file "$FW" || true
 
-          find super_out -maxdepth 1 -name "*.img" | while read -r f; do
-            name=$(basename "$f")
-
-            case "$name" in
-              system${SLOT}.img|vendor${SLOT}.img|product${SLOT}.img|system_ext${SLOT}.img|odm${SLOT}.img|\
-              system_dlkm${SLOT}.img|vendor_dlkm${SLOT}.img|odm_dlkm${SLOT}.img|\
-              vbmeta_system${SLOT}.img|vbmeta_vendor${SLOT}.img)
-                clean=$(echo "$name" | sed "s/${SLOT}//")
-                cp "$f" "final/$clean"
-                ;;
-            esac
-          done
-
-          [ "$(ls final/*.img 2>/dev/null | wc -l)" -gt 0 ] || exit 1
-
-      # Collect non-super
-      - run: |
-          set -e
-
-          if [ "${{ github.event.inputs.INCLUDE_NON_SUPER }}" = "true" ]; then
-            find extracted -type f -name "*.img" | while read -r f; do
-              name=$(basename "$f")
-
-              case "$name" in
-                super*.img*) continue ;;
-                system*.img|vendor*.img|product*.img|system_ext*.img|odm*.img|\
-                system_dlkm*.img|vendor_dlkm*.img|odm_dlkm*.img|\
-                vbmeta_system*.img|vbmeta_vendor*.img)
-                  continue
-                  ;;
-              esac
-
-              cp "$f" "nonsuper/$name" 2>/dev/null || true
-            done
+          SIZE="$(stat -c%s "$FW")"
+          if [ "$SIZE" -lt 1048576 ] && file "$FW" | grep -qiE "html|text"; then
+            echo "::error::Downloaded file is very small and looks like HTML/text, not firmware."
+            echo "The link may be expired, blocked, or needs browser cookies."
+            head -80 "$FW" || true
+            exit 1
           fi
 
-      # Group ROM partitions (4GB)
-      - run: |
-          set -e
+          sha256sum "$FW" | tee "$OUT/download.sha256"
+
+      - name: Extract archive recursively
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+
+          FW="$IN/firmware.bin"
+
+          echo "Extracting main archive..."
+          7z x -y "$FW" "-o$EXTRACTED"
+
+          decompress_one() {
+            local f="$1"
+            local lower="${f,,}"
+
+            case "$lower" in
+              *.br)
+                local out="${f%.*}"
+                [ -e "$out" ] || brotli -f -d "$f" -o "$out"
+                ;;
+              *.zst)
+                local out="${f%.*}"
+                [ -e "$out" ] || zstd -f -d "$f" -o "$out"
+                ;;
+              *.xz)
+                [ -e "${f%.*}" ] || xz -dkf "$f"
+                ;;
+              *.gz)
+                [ -e "${f%.*}" ] || gzip -dkf "$f"
+                ;;
+            esac
+          }
+
+          echo "Decompressing .br/.zst/.xz/.gz files..."
+          while IFS= read -r -d '' f; do
+            decompress_one "$f" || {
+              echo "::warning::Failed to decompress $f"
+            }
+          done < <(find "$EXTRACTED" -type f \( -iname "*.br" -o -iname "*.zst" -o -iname "*.xz" -o -iname "*.gz" \) -print0)
+
+          echo "Extracting nested archives..."
+          for pass in 1 2 3; do
+            while IFS= read -r -d '' a; do
+              dest="${a}.dir"
+              [ -d "$dest" ] && continue
+
+              mkdir -p "$dest"
+              echo "Nested extract: $a"
+              7z x -y "$a" "-o$dest" || {
+                echo "::warning::Could not extract nested archive: $a"
+                rm -rf "$dest"
+              }
+            done < <(find "$EXTRACTED" -type f \( \
+              -iname "*.zip" -o \
+              -iname "*.7z" -o \
+              -iname "*.rar" -o \
+              -iname "*.tar" -o \
+              -iname "*.tgz" -o \
+              -iname "*.tar.gz" -o \
+              -iname "*.tar.xz" -o \
+              -iname "*.tar.zst" \
+            \) -print0)
+          done
+
+          echo "Top-level extracted files:"
+          find "$EXTRACTED" -maxdepth 3 -type f | sed 's#^#  #' | head -300
+
+      - name: Locate and normalize super image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+
+          best=""
+          best_size=0
+
+          while IFS= read -r -d '' f; do
+            n="$(basename "$f")"
+
+            case "$n" in
+              super*.img|super*.raw|super*.img.raw)
+                size="$(stat -c%s "$f")"
+                if [ "$size" -gt "$best_size" ]; then
+                  best="$f"
+                  best_size="$size"
+                fi
+                ;;
+            esac
+          done < <(find "$EXTRACTED" -type f -print0)
+
+          if [ -z "$best" ]; then
+            if find "$EXTRACTED" -type f -name "payload.bin" | grep -q .; then
+              echo "::error::Found payload.bin but no super.img. Extract payload.bin first or add a payload dumper step."
+            else
+              echo "::error::No super.img found in firmware archive."
+            fi
+            exit 1
+          fi
+
+          echo "Selected super image: $best"
+          ls -lh "$best"
+          file "$best" || true
+
+          if file "$best" | grep -qi "Android sparse"; then
+            echo "Converting Android sparse super image to raw..."
+            simg2img "$best" "$WORK/super.raw.img"
+            SUPER_RAW="$WORK/super.raw.img"
+          else
+            SUPER_RAW="$best"
+          fi
+
+          echo "SUPER_RAW=$SUPER_RAW" >> "$GITHUB_ENV"
+
+          echo "Raw super image:"
+          ls -lh "$SUPER_RAW"
+          file "$SUPER_RAW" || true
+
+      - name: Unpack super image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git clone --depth 1 https://github.com/unix3dgforce/lpunpack.git "$WORK/lpunpack"
+
+          "$WORK/venv/bin/python" "$WORK/lpunpack/lpunpack.py" "$SUPER_RAW" "$SUPER_OUT"
+
+          echo "Unpacked super partitions:"
+          find "$SUPER_OUT" -maxdepth 1 -type f -name "*.img" -printf "%f %s bytes\n" | sort
+
+      - name: Collect selected ROM partitions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+
+          wanted=(
+            system
+            vendor
+            product
+            system_ext
+            odm
+            system_dlkm
+            vendor_dlkm
+            odm_dlkm
+            vbmeta_system
+            vbmeta_vendor
+          )
+
+          copied=0
+
+          for f in "$SUPER_OUT"/*.img; do
+            name="$(basename "$f")"
+
+            for base in "${wanted[@]}"; do
+              if [ "$SLOT" = "none" ]; then
+                want="${base}.img"
+                clean="${base}.img"
+              else
+                want="${base}${SLOT}.img"
+                clean="${base}.img"
+              fi
+
+              if [ "$name" = "$want" ]; then
+                echo "Collecting $name -> $clean"
+                cp -f "$f" "$FINAL/$clean"
+                copied=$((copied + 1))
+              fi
+            done
+          done
+
+          if [ "$copied" -eq 0 ]; then
+            echo "::error::No matching ROM partitions found for SLOT=$SLOT"
+            echo "Available:"
+            find "$SUPER_OUT" -maxdepth 1 -type f -name "*.img" -printf "  %f\n" | sort
+            exit 1
+          fi
+
+          echo "Collected ROM partitions:"
+          ls -lh "$FINAL"
+
+      - name: Collect non-super images
+        if: ${{ inputs.INCLUDE_NON_SUPER == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+
+          wanted=(
+            system
+            vendor
+            product
+            system_ext
+            odm
+            system_dlkm
+            vendor_dlkm
+            odm_dlkm
+            vbmeta_system
+            vbmeta_vendor
+          )
+
+          is_logical_partition_name() {
+            local n="$1"
+            local base
+
+            for base in "${wanted[@]}"; do
+              case "$n" in
+                "${base}.img"|"${base}_a.img"|"${base}_b.img")
+                  return 0
+                  ;;
+              esac
+            done
+
+            return 1
+          }
+
+          while IFS= read -r -d '' f; do
+            name="$(basename "$f")"
+
+            case "$name" in
+              super*.img|super*.raw|super*.img.raw)
+                continue
+                ;;
+            esac
+
+            if is_logical_partition_name "$name"; then
+              continue
+            fi
+
+            echo "Collecting non-super image: $name"
+            cp -f "$f" "$NONSUPER/$name" || true
+          done < <(find "$EXTRACTED" -type f -iname "*.img" -print0)
+
+          echo "Collected non-super images:"
+          find "$NONSUPER" -maxdepth 1 -type f -printf "%f %s bytes\n" | sort || true
+
+      - name: Create manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          {
+            echo "Firmware ROM Extractor manifest"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Date UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "Slot: $SLOT"
+            echo "Include non-super: $INCLUDE_NON_SUPER"
+            echo
+            echo "Final ROM partitions:"
+            find "$FINAL" -maxdepth 1 -type f -printf "%f %s bytes\n" | sort
+            echo
+            echo "Non-super images:"
+            find "$NONSUPER" -maxdepth 1 -type f -printf "%f %s bytes\n" | sort || true
+            echo
+            echo "SHA256:"
+            find "$FINAL" "$NONSUPER" -type f -print0 2>/dev/null | xargs -0 -r sha256sum
+          } | tee "$OUT/manifest.txt"
+
+      - name: Group ROM partitions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
           LIMIT=$((4 * 1024 * 1024 * 1024))
-
           declare -a sizes
           declare -a dirs
+
           group_count=0
 
-          for f in $(ls -S final/*.img); do
-            fsize=$(stat -c%s "$f")
+          mapfile -t files < <(find "$FINAL" -maxdepth 1 -type f -name "*.img" -printf "%s %p\n" | sort -nr | cut -d' ' -f2-)
+
+          for f in "${files[@]}"; do
+            fsize="$(stat -c%s "$f")"
             placed=0
 
             for i in "${!sizes[@]}"; do
-              if [ $((sizes[i] + fsize)) -le $LIMIT ]; then
-                cp "$f" "${dirs[i]}/"
+              if [ $((sizes[i] + fsize)) -le "$LIMIT" ]; then
+                cp -f "$f" "${dirs[i]}/"
                 sizes[i]=$((sizes[i] + fsize))
                 placed=1
                 break
@@ -115,49 +430,90 @@ jobs:
             done
 
             if [ "$placed" -eq 0 ]; then
-              dir="groups/part$group_count"
+              dir="$GROUPS/part$group_count"
               mkdir -p "$dir"
-
-              cp "$f" "$dir"
-
-              sizes[$group_count]=$fsize
-              dirs[$group_count]=$dir
+              cp -f "$f" "$dir/"
+              sizes[$group_count]="$fsize"
+              dirs[$group_count]="$dir"
               group_count=$((group_count + 1))
             fi
           done
 
-      # Compress with semantic names
-      - run: |
-          set -e
+          echo "Groups:"
+          find "$GROUPS" -mindepth 1 -maxdepth 2 -type f -printf "%h/%f %s bytes\n" | sort
 
-          OUTPUT="${{ github.event.inputs.OUTPUT_NAME }}"
+      - name: Compress archives
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
 
-          # ROM groups
-          for dir in groups/part*; do
+          safe_output="$(printf '%s' "$OUTPUT_NAME" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//')"
+          [ -n "$safe_output" ] || safe_output="rom"
+
+          compress_dir() {
+            local dir="$1"
+            local prefix="$2"
+
+            local parts
+            parts="$(
+              find "$dir" -maxdepth 1 -type f -name "*.img" -printf "%f\n" \
+                | sed 's/\.img$//' \
+                | sort \
+                | tr '\n' '-' \
+                | sed 's/-$//' \
+                | cut -c1-120
+            )"
+
+            [ -n "$parts" ] || parts="images"
+
+            echo "Compressing $dir -> $prefix-$parts.7z"
+            7z a \
+              -t7z \
+              -m0=lzma2 \
+              -mx="$COMPRESSION_LEVEL" \
+              -md=256m \
+              -mmt=on \
+              -ms=on \
+              -v1900m \
+              "$OUT/${prefix}-${parts}.7z" \
+              "$dir"/*
+          }
+
+          for dir in "$GROUPS"/part*; do
             [ -d "$dir" ] || continue
-
-            parts=$(ls "$dir"/*.img | xargs -n1 basename | sed 's/.img//' | tr '\n' '-' | sed 's/-$//' | cut -c1-120)
-
-            7z a -mx=7 -ms=on -m0=lzma2:d=256m -v1900m \
-              "out/${OUTPUT}-${parts}.7z" "$dir"/*
+            compress_dir "$dir" "$safe_output"
           done
 
-          # NON-SUPER single archive
-          if [ "${{ github.event.inputs.INCLUDE_NON_SUPER }}" = "true" ]; then
-            if ls nonsuper/*.img >/dev/null 2>&1; then
-
-              parts=$(ls nonsuper/*.img | xargs -n1 basename | sed 's/.img//' | tr '\n' '-' | sed 's/-$//' | cut -c1-120)
-
-              7z a -mx=7 -ms=on -m0=lzma2:d=256m -v1900m \
-                "out/${OUTPUT}-nonsuper-${parts}.7z" nonsuper/*
-            fi
+          if [ "$INCLUDE_NON_SUPER" = "true" ] && find "$NONSUPER" -maxdepth 1 -type f -name "*.img" | grep -q .; then
+            compress_dir "$NONSUPER" "${safe_output}-nonsuper"
           fi
 
-      # Release
-      - uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          7z a \
+            -t7z \
+            -mx=5 \
+            -mmt=on \
+            "$OUT/${safe_output}-manifest.7z" \
+            "$OUT/manifest.txt" \
+            "$OUT/download.sha256"
+
+          echo "Output files:"
+          ls -lh "$OUT"
+
+      - name: Upload artifact fallback
+        uses: actions/upload-artifact@v4
+        if: always()
         with:
-          tag_name: ${{ github.run_id }}
+          name: rom-extractor-${{ github.run_id }}
+          path: out/*
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: rom-${{ github.run_id }}
           name: rom-${{ github.run_id }}
-          files: out/*.7z*
+          body_path: out/manifest.txt
+          files: out/*
